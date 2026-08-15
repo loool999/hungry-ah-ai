@@ -636,7 +636,7 @@ class HungarianLoss(nn.Module):
         pres_targets_raw = t_pres.squeeze(-1)
 
         num_gt_objects = pres_targets_raw.sum(dim=1)
-        
+
         # --- 1. Fully Differentiable Soft Count ---
         # Smooth sum of probabilities across all queries (no boolean cutoffs, 100% differentiable)
         soft_count = torch.sigmoid(pres_logits).sum(dim=1)
@@ -735,7 +735,7 @@ class HungarianLoss(nn.Module):
         loss_attrs = ((loss_attrs_all * valid_mask).sum(dim=1) / (valid_count + eps)).mean()
 
         return loss_pres + W_ID * loss_id + W_ATTR * loss_attrs
-    
+
 # ============================================================================
 # EVALUATION & RECONSTRUCTION
 # ============================================================================
@@ -748,15 +748,8 @@ def compute_reconstruction_mse(model, dataset, device):
 
     gt_count = int(tgt_tensor[:, 0].sum().item())
     probs = torch.sigmoid(pred[:, 0])
-    
-    # Adaptive Top-K Selection based on soft predicted count
-    predicted_count = max(1, min(int(round(probs.sum().item())), dataset.max_objects))
-    topk_val, topk_idx = torch.topk(probs, k=predicted_count)
-    
-    presence = torch.zeros_like(probs, dtype=torch.bool)
-    for val, idx in zip(topk_val, topk_idx):
-        if val > 0.20:  # Valid secondary query threshold
-            presence[idx] = True
+
+    presence = probs > 0.5
 
     detected_count = int(presence.sum().item())
 
@@ -796,17 +789,10 @@ def generate_visual_comparison(model, dataset, device):
 
     gt_img = Image.fromarray((img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
     num_gt = int(tgt_tensor[:, 0].sum().item())
-    
+
     probs = torch.sigmoid(pred[:, 0])
-    
-    # Adaptive Top-K Selection
-    predicted_count = max(1, min(int(round(probs.sum().item())), dataset.max_objects))
-    topk_val, topk_idx = torch.topk(probs, k=predicted_count)
-    
-    presence = torch.zeros_like(probs, dtype=torch.bool)
-    for val, idx in zip(topk_val, topk_idx):
-        if val > 0.20:
-            presence[idx] = True
+
+    presence = probs > 0.5
 
     num_detected = int(presence.sum().item())
 
@@ -1217,7 +1203,16 @@ class TrainingGUI:
         self.btn_save_stop.pack(side=tk.LEFT, padx=2)
         ttk.Button(btn, text="🗑 Clear", command=self.clear_log).pack(side=tk.RIGHT, padx=2)
 
-        pane = tk.PanedWindow(main, orient=tk.HORIZONTAL, bg="#313244", sashwidth=4)
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_training = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_training, text="Training Dashboard")
+
+        self.tab_inference = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_inference, text="Interactive Visualization")
+
+        pane = tk.PanedWindow(self.tab_training, orient=tk.HORIZONTAL, bg="#313244", sashwidth=4)
         pane.pack(fill=tk.BOTH, expand=True)
 
         left = ttk.Frame(pane)
@@ -1227,7 +1222,7 @@ class TrainingGUI:
         self.fig = Figure(figsize=(6, 3.8), dpi=100, facecolor='#1e1e2e')
         self.ax_loss = self.fig.add_subplot(211)
         self.ax_acc = self.fig.add_subplot(212)
-        
+
         for ax in (self.ax_loss, self.ax_acc):
             ax.set_facecolor('#313244')
             ax.tick_params(colors="#a6adc8", labelsize=7)
@@ -1272,6 +1267,128 @@ class TrainingGUI:
         self.visual_label.pack(pady=2, expand=True)
         self.visual_placeholder = tk.StringVar(value="Waiting for first validation...")
         ttk.Label(right, textvariable=self.visual_placeholder, style="Side.TLabel").pack()
+
+        # --- Interactive Visualization Tab ---
+        self._build_inference_ui()
+
+    def _build_inference_ui(self):
+        inf_frame = ttk.Frame(self.tab_inference, padding=10)
+        inf_frame.pack(fill=tk.BOTH, expand=True)
+
+        controls = ttk.Frame(inf_frame)
+        controls.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(controls, text="Select Sprite:").pack(side=tk.LEFT, padx=5)
+
+        # We will populate this when engine starts
+        self.sprite_combo = ttk.Combobox(controls, state="readonly", width=30)
+        self.sprite_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(controls, text="Predict", command=self.run_interactive_prediction).pack(side=tk.LEFT, padx=20)
+        ttk.Button(controls, text="Clear Canvas", command=self.clear_interactive_canvas).pack(side=tk.LEFT, padx=5)
+
+        canvas_frame = ttk.Frame(inf_frame)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        left_cv_frame = ttk.Frame(canvas_frame)
+        left_cv_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        ttk.Label(left_cv_frame, text="Click to place sprites:", style="Panel.TLabel").pack(pady=5)
+
+        # Interactive Canvas
+        self.user_canvas = tk.Canvas(left_cv_frame, width=IMG_SIZE, height=IMG_SIZE, bg="gray")
+        self.user_canvas.pack()
+        self.user_canvas.bind("<Button-1>", self.on_canvas_click)
+
+        right_cv_frame = ttk.Frame(canvas_frame)
+        right_cv_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        ttk.Label(right_cv_frame, text="AI Prediction:", style="Panel.TLabel").pack(pady=5)
+
+        self.ai_canvas = tk.Canvas(right_cv_frame, width=IMG_SIZE, height=IMG_SIZE, bg="gray")
+        self.ai_canvas.pack()
+
+        self.placed_objects = []
+
+    def clear_interactive_canvas(self):
+        self.placed_objects = []
+        self.user_canvas.delete("all")
+        self.ai_canvas.delete("all")
+
+    def on_canvas_click(self, event):
+        if not self.engine or not self.engine.dataset:
+            return
+
+        sprite_idx = self.sprite_combo.current()
+        if sprite_idx < 0:
+            return
+
+        x, y = event.x, event.y
+        scale = random.uniform(0.5, 1.5)
+        angle = random.uniform(0, 360)
+        color_shift = np.random.uniform(-30, 30, size=3)
+        layer = random.uniform(0, 1)
+
+        self.placed_objects.append({
+            "id": sprite_idx, "x": x, "y": y, "scale": scale,
+            "angle": angle, "color_shift": color_shift, "layer": layer
+        })
+
+        # Draw on user canvas using PIL for complex rendering, then convert to ImageTk
+        self._update_user_canvas()
+
+    def _update_user_canvas(self):
+        canvas_img = Image.new("RGBA", (IMG_SIZE, IMG_SIZE), (128, 128, 128, 255))
+        self.placed_objects.sort(key=lambda o: o["layer"])
+
+        for obj in self.placed_objects:
+            self.engine.dataset.render_sprite(canvas_img, self.engine.dataset.sprites[obj["id"]],
+                                              obj["x"], obj["y"], obj["scale"], obj["angle"], obj["color_shift"])
+
+        self.user_photo = ImageTk.PhotoImage(canvas_img)
+        self.user_canvas.create_image(0, 0, anchor=tk.NW, image=self.user_photo)
+
+    def run_interactive_prediction(self):
+        if not self.engine or not self.engine.ema or not self.placed_objects:
+            return
+
+        # Build tensor from placed objects
+        canvas_img = Image.new("RGBA", (IMG_SIZE, IMG_SIZE), (128, 128, 128, 255))
+        for obj in self.placed_objects:
+            self.engine.dataset.render_sprite(canvas_img, self.engine.dataset.sprites[obj["id"]],
+                                              obj["x"], obj["y"], obj["scale"], obj["angle"], obj["color_shift"])
+
+        img_rgb = canvas_img.convert("RGB")
+        img_tensor = torch.from_numpy(np.array(img_rgb)).permute(2, 0, 1).float() / 255.0
+
+        self.engine.ema.shadow.eval()
+        with torch.no_grad():
+            img_input = img_tensor.unsqueeze(0).to(DEVICE)
+            pred = self.engine.ema.shadow(img_input)[0]
+
+        probs = torch.sigmoid(pred[:, 0])
+        presence = probs > 0.5
+
+        predictions = []
+        for i in range(self.engine.dataset.max_objects):
+            if presence[i]:
+                obj_id = torch.argmax(pred[i, 1:1 + self.engine.dataset.num_sprites]).item()
+                attrs = pred[i, 1 + self.engine.dataset.num_sprites:]
+                layer_depth = attrs[8].item()
+                predictions.append((layer_depth, obj_id, attrs))
+
+        predictions.sort(key=lambda p: p[0])
+
+        ai_canvas_img = Image.new("RGBA", (IMG_SIZE, IMG_SIZE), (128, 128, 128, 255))
+        for layer_depth, obj_id, attrs in predictions:
+            x = attrs[0].item() * IMG_SIZE
+            y = attrs[1].item() * IMG_SIZE
+            angle = math.degrees(math.atan2(attrs[2].item(), attrs[3].item()))
+            scale = attrs[4].item() * 3.0
+            cs = attrs[5:8].cpu().numpy() * 30.0
+            self.engine.dataset.render_sprite(ai_canvas_img, self.engine.dataset.sprites[obj_id], x, y, scale, angle, cs)
+
+        self.ai_photo = ImageTk.PhotoImage(ai_canvas_img)
+        self.ai_canvas.create_image(0, 0, anchor=tk.NW, image=self.ai_photo)
+
 
     def append_log(self, msg):
         self.log_text.configure(state=tk.NORMAL)
@@ -1320,7 +1437,7 @@ class TrainingGUI:
         x_axis = steps if (steps and len(steps) == len(accuracies)) else list(range(1, len(accuracies) + 1))
         self.ax_acc.plot(x_axis, accuracies, color="#a6e3a1", linewidth=1.5, marker='o', markersize=2)
         self.ax_acc.set_ylabel("Accuracy %", color="#a6adc8", fontsize=7)
-        
+
         min_acc = max(0.0, min(accuracies) - 2.0)
         max_acc = min(100.0, max(accuracies) + 2.0)
         if max_acc > min_acc:
@@ -1356,8 +1473,118 @@ class TrainingGUI:
         self.btn_resume.config(state=tk.DISABLED)
         self.btn_save_stop.config(state=tk.NORMAL)
         self.engine = TrainingEngine(self.msg_queue)
-        self.train_thread = threading.Thread(target=self.engine.train, daemon=True)
+
+        # We need to setup dataset before starting training thread to populate UI
+        self.engine.setup()
+        self.sprite_combo['values'] = self.engine.dataset.sprite_names
+        if self.engine.dataset.sprite_names:
+            self.sprite_combo.current(0)
+
+        # We start a modified training method since we already setup
+        self.train_thread = threading.Thread(target=self._run_training, daemon=True)
         self.train_thread.start()
+
+    def _run_training(self):
+        # Continue the training setup process that was inside engine.train()
+        self.engine.load_checkpoint()
+        total_batches = len(self.engine.dataloader)
+        total_steps = NUM_EPOCHS * total_batches
+        self.engine.log(f"Training: {NUM_EPOCHS} epochs × {total_batches} batches")
+        self.engine.log("─" * 50)
+
+        try:
+            comp, met = generate_visual_comparison(self.engine.ema.shadow, self.engine.dataset, DEVICE)
+            self.engine.update_visual(comp, met)
+        except Exception:
+            pass
+        self.engine.update_curriculum(self.engine.curriculum.get_summary())
+
+        # Re-use the training loop from engine.train() by calling a slightly modified version
+        self._engine_train_loop(total_batches, total_steps)
+
+    def _engine_train_loop(self, total_batches, total_steps):
+        for epoch in range(self.engine.start_epoch, NUM_EPOCHS):
+            self.engine.current_epoch = epoch
+            if self.engine.stop_flag:
+                break
+            self.engine.model.train()
+            epoch_loss = 0.0
+
+            for i, (imgs, tgts) in enumerate(self.engine.dataloader):
+                if self.engine.stop_flag:
+                    break
+                while self.engine.pause_flag:
+                    time.sleep(0.1)
+                    if self.engine.stop_flag:
+                        break
+                if self.engine.stop_flag:
+                    break
+
+                current_lr = get_lr_at_step(self.engine.global_step, LR, WARMUP_STEPS, total_steps)
+                for pg in self.engine.optimizer.param_groups:
+                    mult = BACKBONE_LR_MULT if pg.get("name") == "backbone" else 1.0
+                    pg['lr'] = current_lr * mult
+
+                imgs = imgs.to(DEVICE, non_blocking=True)
+                tgts = tgts.to(DEVICE, non_blocking=True)
+                self.engine.optimizer.zero_grad(set_to_none=True)
+
+                with torch.autocast(device_type=DEVICE.type, enabled=USE_AMP):
+                    dn_targets = tgts if USE_DENOISING_TRAINING else None
+                    model_out = self.engine.model(imgs, targets=dn_targets, return_all_layers=True)
+
+                if USE_DENOISING_TRAINING:
+                    preds_all, dn_all = model_out
+                else:
+                    preds_all, dn_all = model_out, None
+
+                layer_losses = [self.engine.criterion(p.float(), tgts) for p in preds_all]
+                loss = sum(layer_losses) / len(layer_losses)
+
+                if dn_all is not None:
+                    dn_layer_losses = [self.engine.criterion.forward_dn(p.float(), tgts) for p in dn_all]
+                    loss = loss + W_DN * (sum(dn_layer_losses) / len(dn_layer_losses))
+
+                self.engine.scaler.scale(loss).backward()
+                self.engine.scaler.unscale_(self.engine.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.engine.model.parameters(), GRAD_CLIP)
+                self.engine.scaler.step(self.engine.optimizer)
+                self.engine.scaler.update()
+                self.engine.ema.update(self.engine.model)
+
+                loss_val = float(loss.item())
+                epoch_loss += loss_val
+                self.engine.global_step += 1
+                self.engine.history["batch_losses"].append(loss_val)
+
+                if i % 10 == 0:
+                    self.engine.log(
+                        f"E{epoch} B{i}/{total_batches} │ Loss:{loss_val:.3f} │ "
+                        f"LR:{current_lr:.1e} │ Lvl:{self.engine.curriculum.current_max}"
+                    )
+                    self.engine.update_loss_plot(self.engine.history["batch_losses"][-300:])
+
+                if self.engine.global_step % VALIDATION_INTERVAL == 0:
+                    self.engine.run_validation()
+
+                if self.engine.global_step % VISUAL_UPDATE_INTERVAL == 0:
+                    try:
+                        comp, met = generate_visual_comparison(self.engine.ema.shadow, self.engine.dataset, DEVICE)
+                        self.engine.update_visual(comp, met)
+                    except Exception:
+                        pass
+
+                self.engine.update_status(epoch, i, total_batches, loss_val, current_lr)
+
+            if not self.engine.stop_flag:
+                avg_loss = epoch_loss / max(1, total_batches)
+                self.engine.history["epoch_losses"].append(avg_loss)
+                self.engine.log(f"═══ Epoch {epoch} │ Loss: {avg_loss:.4f} │ Level: {self.engine.curriculum.level_name} ═══")
+                self.engine.save_checkpoint(epoch)
+
+        self.engine.log("Training complete.")
+        self.engine.msg_queue.put(("done",))
+
 
     def pause_training(self):
         if self.engine:
