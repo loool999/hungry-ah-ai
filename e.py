@@ -23,65 +23,69 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-OBJ_DIR = "object_ids"
-IMG_SIZE = 256
-MAX_OBJECTS_FINAL = 12
-BATCH_SIZE = 16
-NUM_EPOCHS = 200
-LR = 3e-4
-BACKBONE_LR_MULT = 0.1     # Backbone fine-tuning multiplier
-WARMUP_STEPS = 300
-GRAD_CLIP = 1.0
-WEIGHT_DECAY = 1e-4
+# Core Environment Settings
+OBJ_DIR = "object_ids"             # Directory containing PNG sprite files
+IMG_SIZE = 256                     # Resolution of generated images (WxH)
+MAX_OBJECTS_FINAL = 12             # Maximum possible objects the model will learn to detect/place
+
+# Training Hyperparameters
+BATCH_SIZE = 16                    # Images per batch
+NUM_EPOCHS = 200                   # Total training epochs
+LR = 3e-4                          # Base learning rate for transformer heads
+BACKBONE_LR_MULT = 0.1             # LR multiplier for ResNet backbone (frozen earlier layers, fine-tuned later)
+WARMUP_STEPS = 300                 # Linear warmup steps for learning rate schedule
+GRAD_CLIP = 1.0                    # Max gradient norm to prevent exploding gradients
+WEIGHT_DECAY = 1e-4                # L2 regularization factor
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CHECKPOINT_FILE = "scene_ai_checkpoint.pth"
-BEST_CHECKPOINT_FILE = "scene_ai_best.pth"
-HISTORY_FILE = "training_history.json"
-NUM_WORKERS = min(4, os.cpu_count() or 2)
-USE_AMP = DEVICE.type == "cuda"
+CHECKPOINT_FILE = "scene_ai_checkpoint.pth"    # Save state path
+BEST_CHECKPOINT_FILE = "scene_ai_best.pth"     # Best model path
+HISTORY_FILE = "training_history.json"         # Loss & accuracy stats
+NUM_WORKERS = min(4, os.cpu_count() or 2)      # Threads for Dataloader
+USE_AMP = DEVICE.type == "cuda"                # Automatic Mixed Precision for speed
 
 if DEVICE.type == "cuda":
     torch.backends.cudnn.benchmark = True
 
-# Curriculum Configuration
-STREAK_NEEDED = 10
-VALIDATION_INTERVAL = 1
-SUCCESS_MSE_THRESHOLD = 0.01
-VISUAL_UPDATE_INTERVAL = 1
+# Curriculum Configuration (Gradual Learning)
+STREAK_NEEDED = 10                 # Consecutive successes required to bump to the next level (N objects)
+VALIDATION_INTERVAL = 1            # How often (in steps) to check the MSE threshold
+SUCCESS_MSE_THRESHOLD = 0.01       # MSE error threshold needed to be considered a 'success'
+VISUAL_UPDATE_INTERVAL = 1         # How often to update the GUI visualization
 
-STALL_RELAX_ATTEMPTS = 150
-STALL_RELAX_FACTOR = 1.15
-STALL_RELAX_MAX = 0.05
+STALL_RELAX_ATTEMPTS = 150         # If stuck at one level for 150 attempts, relax the criteria
+STALL_RELAX_FACTOR = 1.15          # Multiply MSE threshold by this if stuck
+STALL_RELAX_MAX = 0.05             # Cap on how much the MSE threshold can be relaxed
 
 # Decoder & Training Knobs
-NUM_DECODER_LAYERS = 4
-EMA_DECAY = 0.999
-VALIDATION_SAMPLES = 5
-CURRICULUM_BAND = 4
-LABEL_SMOOTHING = 0.05
+NUM_DECODER_LAYERS = 4             # Number of Transformer Decoder layers
+EMA_DECAY = 0.999                  # Exponential Moving Average for stable model evaluation
+VALIDATION_SAMPLES = 5             # Number of sample inferences to average for curriculum checks
+CURRICULUM_BAND = 4                # Determines range of objects shown to model in training (e.g., current_lvl - 4)
+LABEL_SMOOTHING = 0.05             # Prevents overconfidence in object class ID prediction
 
 # Denoising Training (DN-DETR)
+# Denoising adds artificial noise to ground truth and asks the model to reconstruct it, stabilizing bipartite matching.
 USE_DENOISING_TRAINING = True
-DN_POS_NOISE_SCALE = 0.15
-DN_CLASS_NOISE_PROB = 0.2
-W_DN = 1.0
+DN_POS_NOISE_SCALE = 0.15          # Noise added to x/y positions
+DN_CLASS_NOISE_PROB = 0.2          # Probability of flipping object ID to noise
+W_DN = 1.0                         # Weight multiplier for the denoising loss branch
 
-# Loss Knobs
-FOCAL_ALPHA = 0.75
-FOCAL_GAMMA = 2.0
+# Loss Knobs (Hungarian Loss Assignment)
+FOCAL_ALPHA = 0.75                 # Balances positive/negative query presence
+FOCAL_GAMMA = 2.0                  # Focuses loss on hard-to-predict queries
 
-W_ID = 3.0
-W_ATTR = 1.5
-W_MATCH_PRES = 20.0
-W_NO_DETECT_PENALTY = 15.0
-W_CARDINALITY = 20.0
+W_ID = 3.0                         # Weight for Object Class Identification loss
+W_ATTR = 1.5                       # Base weight for attributes (size, rotation, color, position)
+W_MATCH_PRES = 20.0                # Hungarian matching cost for object presence
+W_NO_DETECT_PENALTY = 15.0         # Heavy penalty if model predicts FEWER objects than ground truth
+W_CARDINALITY = 20.0               # Smooth penalty to force sum(probs) == ground_truth_count
 
 # Attribute L1 weights: [x, y, sin, cos, scale, r, g, b, layer]
-W_ATTR_POS = 2.0
-W_ATTR_ROT = 1.0
-W_ATTR_SCALE = 1.0
-W_ATTR_COLOR = 2.5
-W_ATTR_LAYER = 1.0
+W_ATTR_POS = 2.0                   # Importance of precise x/y coordinates
+W_ATTR_ROT = 1.0                   # Importance of rotation (sine/cosine representation)
+W_ATTR_SCALE = 1.0                 # Importance of sprite scale/size
+W_ATTR_COLOR = 2.5                 # Importance of RGB color shifting
+W_ATTR_LAYER = 1.0                 # Importance of depth layer (z-index)
 
 
 def _attr_weight_vector(device, dtype):
@@ -544,7 +548,7 @@ class ScenePredictor(nn.Module):
 
         return dn_content, dn_anchor
 
-    def forward(self, x, targets=None, return_all_layers=False):
+    def forward(self, x, targets=None, return_all_layers=False, return_feat=False):
         B = x.size(0)
         feat_mid = self.stem(x)
         feat_l3 = self.layer3(feat_mid)
@@ -588,6 +592,11 @@ class ScenePredictor(nn.Module):
             else:
                 matching, dn = preds_all[:, :M], preds_all[:, M:]
             return matching, dn
+
+        if return_feat:
+            # Return the fused feature map averaged across channels
+            feat_map = feat_fused.mean(dim=1).squeeze(0).cpu().numpy()
+            return preds_all, feat_map
         return preds_all
 
 # ============================================================================
@@ -744,7 +753,8 @@ def compute_reconstruction_mse(model, dataset, device):
     with torch.no_grad():
         img_tensor, tgt_tensor = dataset.generate_fixed_n()
         img_input = img_tensor.unsqueeze(0).to(device)
-        pred = model(img_input)[0]
+        pred, feat_map = model(img_input, return_feat=True)
+        pred = pred[0]
 
     gt_count = int(tgt_tensor[:, 0].sum().item())
     probs = torch.sigmoid(pred[:, 0])
@@ -785,7 +795,8 @@ def generate_visual_comparison(model, dataset, device):
     with torch.no_grad():
         img_tensor, tgt_tensor = dataset.generate_fixed_n()
         img_input = img_tensor.unsqueeze(0).to(device)
-        pred = model(img_input)[0]
+        pred, feat_map = model(img_input, return_feat=True)
+        pred = pred[0]
 
     gt_img = Image.fromarray((img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
     num_gt = int(tgt_tensor[:, 0].sum().item())
@@ -828,7 +839,7 @@ def generate_visual_comparison(model, dataset, device):
     draw.text((IMG_SIZE + gap + IMG_SIZE // 2 - 45, 5), "AI Prediction", fill=(137, 180, 250), font=font)
     comp.paste(gt_img, (0, label_h))
     comp.paste(ai_img, (IMG_SIZE + gap, label_h))
-    return comp, {"gt_objects": num_gt, "detected_objects": num_detected}
+    return comp, {"gt_objects": num_gt, "detected_objects": num_detected, "probs": probs.cpu().numpy(), "feat_map": feat_map}
 
 # ============================================================================
 # LR SCHEDULER
@@ -1212,6 +1223,10 @@ class TrainingGUI:
         self.tab_inference = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_inference, text="Interactive Visualization")
 
+        self.tab_activations = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_activations, text="Network Activations")
+        self._build_activations_ui()
+
         pane = tk.PanedWindow(self.tab_training, orient=tk.HORIZONTAL, bg="#313244", sashwidth=4)
         pane.pack(fill=tk.BOTH, expand=True)
 
@@ -1287,6 +1302,40 @@ class TrainingGUI:
         ttk.Button(controls, text="Predict", command=self.run_interactive_prediction).pack(side=tk.LEFT, padx=20)
         ttk.Button(controls, text="Clear Canvas", command=self.clear_interactive_canvas).pack(side=tk.LEFT, padx=5)
 
+        slider_frame = ttk.Frame(inf_frame)
+        slider_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(slider_frame, text="Scale:").pack(side=tk.LEFT, padx=(5,2))
+        self.scale_slider = ttk.Scale(slider_frame, from_=0.3, to=2.5, orient=tk.HORIZONTAL, length=100)
+        self.scale_slider.set(1.0)
+        self.scale_slider.pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(slider_frame, text="Angle (deg):").pack(side=tk.LEFT, padx=(5,2))
+        self.angle_slider = ttk.Scale(slider_frame, from_=0.0, to=360.0, orient=tk.HORIZONTAL, length=100)
+        self.angle_slider.set(0.0)
+        self.angle_slider.pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(slider_frame, text="R Shift:").pack(side=tk.LEFT, padx=(5,2))
+        self.r_slider = ttk.Scale(slider_frame, from_=-30, to=30, orient=tk.HORIZONTAL, length=80)
+        self.r_slider.set(0)
+        self.r_slider.pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(slider_frame, text="G Shift:").pack(side=tk.LEFT, padx=(5,2))
+        self.g_slider = ttk.Scale(slider_frame, from_=-30, to=30, orient=tk.HORIZONTAL, length=80)
+        self.g_slider.set(0)
+        self.g_slider.pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(slider_frame, text="B Shift:").pack(side=tk.LEFT, padx=(5,2))
+        self.b_slider = ttk.Scale(slider_frame, from_=-30, to=30, orient=tk.HORIZONTAL, length=80)
+        self.b_slider.set(0)
+        self.b_slider.pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(slider_frame, text="Depth (Z):").pack(side=tk.LEFT, padx=(5,2))
+        self.layer_slider = ttk.Scale(slider_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=100)
+        self.layer_slider.set(0.5)
+        self.layer_slider.pack(side=tk.LEFT, padx=(0,10))
+
+
         canvas_frame = ttk.Frame(inf_frame)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1322,10 +1371,13 @@ class TrainingGUI:
             return
 
         x, y = event.x, event.y
-        scale = random.uniform(0.5, 1.5)
-        angle = random.uniform(0, 360)
-        color_shift = np.random.uniform(-30, 30, size=3)
-        layer = random.uniform(0, 1)
+        scale = self.scale_slider.get()
+        angle = self.angle_slider.get()
+        r = self.r_slider.get()
+        g = self.g_slider.get()
+        b = self.b_slider.get()
+        color_shift = np.array([r, g, b], dtype=np.float32)
+        layer = self.layer_slider.get()
 
         self.placed_objects.append({
             "id": sprite_idx, "x": x, "y": y, "scale": scale,
@@ -1362,7 +1414,8 @@ class TrainingGUI:
         self.engine.ema.shadow.eval()
         with torch.no_grad():
             img_input = img_tensor.unsqueeze(0).to(DEVICE)
-            pred = self.engine.ema.shadow(img_input)[0]
+            pred, feat_map = self.engine.ema.shadow(img_input, return_feat=True)
+            pred = pred[0]
 
         probs = torch.sigmoid(pred[:, 0])
         presence = probs > 0.5
@@ -1388,6 +1441,7 @@ class TrainingGUI:
 
         self.ai_photo = ImageTk.PhotoImage(ai_canvas_img)
         self.ai_canvas.create_image(0, 0, anchor=tk.NW, image=self.ai_photo)
+        self.update_activations_plot(probs.cpu().numpy(), feat_map)
 
 
     def append_log(self, msg):
@@ -1400,6 +1454,67 @@ class TrainingGUI:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+
+    def _build_activations_ui(self):
+        act_frame = ttk.Frame(self.tab_activations, padding=10)
+        act_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(act_frame, text="Query Presence Probability (Activations)", style="Panel.TLabel").pack(anchor=tk.W, pady=5)
+
+        self.fig_act = Figure(figsize=(10, 4), dpi=100, facecolor='#1e1e2e')
+        self.ax_act = self.fig_act.add_subplot(121)
+        self.ax_feat = self.fig_act.add_subplot(122)
+
+        self.ax_feat.set_facecolor('#313244')
+        self.ax_feat.tick_params(colors="#a6adc8", labelsize=8)
+        self.ax_feat.set_title("CNN Feature Map Activation", color="#cdd6f4")
+        for s in self.ax_feat.spines.values():
+            s.set_color('#585b70')
+
+        self.ax_act.set_facecolor('#313244')
+        self.ax_act.tick_params(colors="#a6adc8", labelsize=8)
+        for s in self.ax_act.spines.values():
+            s.set_color('#585b70')
+
+        self.canvas_act = FigureCanvasTkAgg(self.fig_act, master=act_frame)
+        self.canvas_act.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self._act_bars = None
+
+    def update_activations_plot(self, probs, feat_map=None):
+        if probs is None:
+            return
+
+        self.ax_act.clear()
+        self.ax_act.set_facecolor('#313244')
+        self.ax_act.tick_params(colors="#a6adc8", labelsize=8)
+        for s in self.ax_act.spines.values():
+            s.set_color('#585b70')
+
+        x = np.arange(len(probs))
+
+        # Color code: green if > 0.5 (active), red if <= 0.5 (inactive)
+        colors = ['#a6e3a1' if p > 0.5 else '#f38ba8' for p in probs]
+
+        self.ax_act.bar(x, probs, color=colors)
+        self.ax_act.set_ylim(0, 1.0)
+        self.ax_act.set_xticks(x)
+        self.ax_act.set_xticklabels([f"Q{i}" for i in x])
+        self.ax_act.set_ylabel("Probability", color="#a6adc8")
+        self.ax_act.set_title("Neural Network Query Activations (Real-time)", color="#cdd6f4")
+
+        # Draw a threshold line at 0.5
+        self.ax_act.axhline(0.5, color="#89b4fa", linestyle="--", linewidth=1.5, alpha=0.7)
+
+        if feat_map is not None:
+            self.ax_feat.clear()
+            self.ax_feat.set_title("CNN Feature Map Activation (Avg)", color="#cdd6f4")
+            self.ax_feat.imshow(feat_map, cmap='magma')
+            self.ax_feat.axis('off')
+
+        self.fig_act.tight_layout()
+        self.canvas_act.draw_idle()
 
     def update_loss_plot(self, losses):
         if not losses:
@@ -1447,6 +1562,8 @@ class TrainingGUI:
         self.canvas_widget.draw_idle()
 
     def update_visual(self, pil_img, metrics):
+        if "probs" in metrics:
+            self.update_activations_plot(metrics["probs"], metrics.get("feat_map"))
         max_w = 520
         w, h = pil_img.size
         if w > max_w:
